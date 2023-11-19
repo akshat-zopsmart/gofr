@@ -15,7 +15,7 @@ func (m *MockConfig) Get(key string) string {
 // the corresponding value else it returns the specified defaultValue.
 func (m *MockConfig) GetOrDefault(key, defaultValue string) string {
 	v, ok := m.Data[key]
-	if ok {
+	if ok && v != "" {
 		return v
 	}
 
