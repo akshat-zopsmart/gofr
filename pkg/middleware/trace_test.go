@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"gofr.dev/pkg"
+	"gofr.dev/pkg/gofr"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -31,7 +33,7 @@ func TestTrace(t *testing.T) {
 
 	otel.SetTracerProvider(tp)
 
-	handler := Trace("Gofr-App", "dev", "zipkin")(&MockHandlerForTracing{})
+	handler := Trace(pkg.DefaultAppName, pkg.DefaultAppVersion, gofr.ZIPKIN)(&MockHandlerForTracing{})
 	req := httptest.NewRequest("GET", "/dummy", nil)
 
 	recorder := httptest.NewRecorder()
