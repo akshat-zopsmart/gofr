@@ -3,9 +3,8 @@
 package config
 
 import (
-	"os"
-
 	"github.com/joho/godotenv"
+	"os"
 )
 
 type GoDotEnvProvider struct {
@@ -78,5 +77,6 @@ func (g *GoDotEnvProvider) GetOrDefault(key, defaultValue string) string {
 		return val
 	}
 
+	g.logger.Infof("%s is not set.'%s' will be used by default", key, defaultValue)
 	return defaultValue
 }
