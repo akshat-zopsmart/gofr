@@ -1,147 +1,148 @@
 package gofr
 
 import (
-	"errors"
-	"io"
-	"testing"
-
+	"bytes"
+	cloudtrace "github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/trace"
+	"go.opentelemetry.io/otel/exporters/zipkin"
 	"go.opentelemetry.io/otel/sdk/trace"
+	"gofr.dev/pkg"
+	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 
 	"github.com/stretchr/testify/assert"
 
-	gofrErr "gofr.dev/pkg/errors"
 	"gofr.dev/pkg/gofr/config"
 	"gofr.dev/pkg/log"
 )
 
-func TestTraceExporterSuccess(t *testing.T) {
-	logger := log.NewMockLogger(io.Discard)
-	cfg := config.NewGoDotEnvProvider(logger, "../../configs")
-	err := tracerProvider(cfg, logger)
-
-	assert.NoError(t, err)
-}
-
-func TestTraceExporterFailure(t *testing.T) {
-	logger := log.NewMockLogger(io.Discard)
-
-	testcases := []struct {
-		desc        string
-		exporter    string
-		url         string
-		appName     string
-		expectedErr error
+func Test_tracerProvider(t *testing.T) {
+	b := new(bytes.Buffer)
+	logger := log.NewMockLogger(b)
+	testCases := []struct {
+		configData map[string]string
+		expected   *trace.TracerProvider
+		err        bool
 	}{
-		{"when exporter is neither zipkin nor gcp", "not zipkin", "http://localhost/9411", "gofr", gofrErr.Error("invalid exporter")},
-		{"when exporter is zipkin", "zipkin", "invalid url", "gofr", errors.New("invalid collector " +
-			"URL \"invalid url/api/v2/spans\": no scheme or host")},
-		{"when exporter is gcp", "gcp", "http://fakeProject/9411", "sample-api", errors.New("stackdriver: " +
-			"google: error getting credentials using GOOGLE_APPLICATION_CREDENTIALS environment variable: open secretkey.json: " +
-			"no such file or directory")},
+		{map[string]string{"TRACER_EXPORTER": ZIPKIN}, nil, true},
+		{map[string]string{"TRACER_EXPORTER": ZIPKIN, "TRACER_URL": "http://localhost:9411"}, nil, false},
+		{map[string]string{"TRACER_EXPORTER": GCP}, nil, true},
+		{map[string]string{"TRACER_EXPORTER": ""}, nil, false},
+	}
+	for _, testCase := range testCases {
+		c := &config.MockConfig{Data: testCase.configData}
+		_, err := getTraceProvider(c, logger)
+		assert.Equal(t, err != nil, testCase.err)
+	}
+}
+func Test_getResourceAttributes(t *testing.T) {
+	testCases := []struct {
+		configData map[string]string
+		attributes []attribute.KeyValue
+	}{
+		{map[string]string{"APP_VERSION": "1", "APP_NAME": "Sample"}, []attribute.KeyValue{
+			attribute.String(string(semconv.TelemetrySDKLanguageKey), "go"),
+			attribute.String(string(semconv.TelemetrySDKVersionKey), "1"),
+			attribute.String(string(semconv.ServiceNameKey), "Sample"),
+		}},
+		{map[string]string{"APP_VERSION": "", "APP_NAME": "Sample"}, []attribute.KeyValue{
+			attribute.String(string(semconv.TelemetrySDKLanguageKey), "go"),
+			attribute.String(string(semconv.TelemetrySDKVersionKey), pkg.DefaultAppVersion),
+			attribute.String(string(semconv.ServiceNameKey), "Sample"),
+		}},
+		{map[string]string{"APP_VERSION": "1", "APP_NAME": ""}, []attribute.KeyValue{
+			attribute.String(string(semconv.TelemetrySDKLanguageKey), "go"),
+			attribute.String(string(semconv.TelemetrySDKVersionKey), "1"),
+			attribute.String(string(semconv.ServiceNameKey), pkg.DefaultAppName),
+		}},
+		{map[string]string{}, []attribute.KeyValue{
+			attribute.String(string(semconv.TelemetrySDKLanguageKey), "go"),
+			attribute.String(string(semconv.TelemetrySDKVersionKey), pkg.DefaultAppVersion),
+			attribute.String(string(semconv.ServiceNameKey), pkg.DefaultAppName),
+		}},
 	}
 
-	for i, tc := range testcases {
-		cfg := &config.MockConfig{Data: map[string]string{
-			"TRACER_EXPORTER": tc.exporter,
-			"TRACER_URL":      tc.url,
-		}}
-
-		err := tracerProvider(cfg, logger)
-
-		assert.Equal(t, tc.expectedErr, err, "Test[%d],Failed[%v]", i, tc.desc)
+	for _, testCase := range testCases {
+		mockConfig := &config.MockConfig{Data: testCase.configData}
+		assert.Equal(t, testCase.attributes, getResourceAttributes(mockConfig))
 	}
 }
 
-func TestGetZipkinExporter(t *testing.T) {
-	logger := log.NewMockLogger(io.Discard)
-	testcases := []struct {
-		desc         string
+func Test_getSampler(t *testing.T) {
+	testCases := []struct {
+		configData   map[string]string
 		sampler      trace.Sampler
-		alwaysSample string
-		expTrace     *trace.TracerProvider
+		loggerString bool
 	}{
-		{"URL:valid,SAMPLING:AlwaysSample", trace.AlwaysSample(), "true", &trace.TracerProvider{}},
-		{"URL:valid,SAMPLING:ParentBased", trace.ParentBased(trace.TraceIDRatioBased(0.1)), "false", &trace.TracerProvider{}},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "", "TRACER_RATIO": ""}, trace.ParentBased(trace.TraceIDRatioBased(0.1)), true},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "", "TRACER_RATIO": "0.3"}, trace.ParentBased(trace.TraceIDRatioBased(0.3)), true},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "", "TRACER_RATIO": "hello"}, trace.ParentBased(trace.TraceIDRatioBased(0.1)), true},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "hello", "TRACER_RATIO": "hello"}, trace.ParentBased(trace.TraceIDRatioBased(0.1)), true},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "true", "TRACER_RATIO": "0.3"}, trace.AlwaysSample(), false},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "true", "TRACER_RATIO": "hello"}, trace.AlwaysSample(), false},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "true", "TRACER_RATIO": ""}, trace.AlwaysSample(), false},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "false", "TRACER_RATIO": "0.2"}, trace.ParentBased(trace.TraceIDRatioBased(0.2)), false},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "false", "TRACER_RATIO": "hello"}, trace.ParentBased(trace.TraceIDRatioBased(0.1)), true},
+		{map[string]string{"TRACER_ALWAYS_SAMPLE": "false", "TRACER_RATIO": ""}, trace.ParentBased(trace.TraceIDRatioBased(0.1)), true},
 	}
 
-	for i, tc := range testcases {
-		cfg := &config.MockConfig{Data: map[string]string{
-			"TRACER_EXPORTER":      "zipkin",
-			"TRACER_URL":           "http://localhost/9411",
-			"TRACER_ALWAYS_SAMPLE": tc.alwaysSample,
-		}}
-
-		e := &exporter{url: "http://localhost/9411"}
-
-		tracers, err := e.getZipkinExporter(cfg, logger)
-
-		assert.IsTypef(t, tc.expTrace, tracers, "Test[%d],failed:%v", i, tc.desc)
-		assert.Nil(t, err, "Test[%d],failed:%v", i, tc.desc)
-	}
-}
-
-func TestGetZipkinExporter_Fail(t *testing.T) {
-	cfg := &config.MockConfig{Data: map[string]string{
-		"TRACER_EXPORTER": "zipkin",
-		"TRACER_URL":      "invalid url",
-	}}
-
-	e := &exporter{url: "invalid url"}
-
-	tracers, err := e.getZipkinExporter(cfg, log.NewMockLogger(io.Discard))
-
-	assert.Nil(t, tracers, "invalid URL")
-	assert.Error(t, errors.New(""), err, "invalid URL")
-}
-
-func TestGetGCPExporter_Fail(t *testing.T) {
-	cfg := &config.MockConfig{Data: map[string]string{
-		"TRACER_EXPORTER": "zipkin",
-		"TRACER_URL":      "invalid url",
-	}}
-
-	tracers, err := getGCPExporter(cfg, log.NewMockLogger(io.Discard))
-
-	assert.Nil(t, tracers, "invalid URL")
-	assert.Error(t, err, "invalid URL")
-}
-
-func Test_getResource(t *testing.T) {
-	mockconfig := &MockConfig{GetOrDefaultFunc: func(key, defaultValue string) string {
-		if key == "APP_VERSION" {
-			return "TestVersion"
-		} else if key == "APP_NAME" {
-			return "TestApp"
+	for _, testCase := range testCases {
+		mockConfig := &config.MockConfig{Data: testCase.configData}
+		b := new(bytes.Buffer)
+		logger := log.NewMockLogger(b)
+		assert.Equal(t, testCase.sampler, getSampler(mockConfig, logger))
+		if testCase.loggerString {
+			assert.NotEmptyf(t, b.String(), "Log empty")
 		}
-		return defaultValue
-	}, GetFunc: func(string2 string) string {
-		return ""
-	}}
+		// We're not validating for empty logger scenarios as the config function
+		// may have logs for success scenario as well
+	}
+}
 
-	r, err := getResource(mockconfig)
-
-	expectedAttributes := []attribute.KeyValue{
-		attribute.String(string(semconv.TelemetrySDKLanguageKey), "go"),
-		attribute.String(string(semconv.TelemetrySDKVersionKey), "TestVersion"),
-		attribute.String(string(semconv.ServiceNameKey), "TestApp"),
+func Test_getZipkinExporter(t *testing.T) {
+	validExporter, err := zipkin.New("http://localhost/9411" + "/api/v2/spans")
+	if err != nil {
+		t.Logf("Failed to setup test %v", err)
 	}
 
-	assert.NoError(t, err, "Tests failed")
-	assert.ElementsMatch(t, expectedAttributes, r.Attributes())
+	testCases := []struct {
+		configData map[string]string
+		exporter   *zipkin.Exporter
+		err        bool
+	}{
+		{map[string]string{"TRACER_URL": ""}, nil, true},
+		{map[string]string{"TRACER_URL": "http://localhost/9411"}, validExporter, false},
+	}
+
+	for _, testCase := range testCases {
+		mockConfig := &config.MockConfig{Data: testCase.configData}
+		result, err := getZipkinExporter(mockConfig)
+		assert.Equal(t, testCase.exporter, result)
+		assert.Equal(t, err != nil, testCase.err)
+	}
 }
 
-type MockConfig struct {
-	GetOrDefaultFunc func(key, defaultValue string) string
-	GetFunc          func(string) string
-}
+func Test_getGCPExporter(t *testing.T) {
 
-func (m *MockConfig) GetOrDefault(key, defaultValue string) string {
-	return m.GetOrDefaultFunc(key, defaultValue)
-}
+	validExporter, err := cloudtrace.New(cloudtrace.WithProjectID("12345678"))
+	if err != nil {
+		t.Fatalf("Failed to setup test %v", err)
+	}
 
-func (m *MockConfig) Get(string) string {
-	return ""
+	testCases := []struct {
+		configData map[string]string
+		exporter   *cloudtrace.Exporter
+		err        bool
+	}{
+		{map[string]string{"GCP_PROJECT_ID": ""}, nil, true},
+		{map[string]string{"GCP_PROJECT_ID": "12345678"}, validExporter, false},
+	}
+
+	for _, testCase := range testCases {
+		mockConfig := &config.MockConfig{Data: testCase.configData}
+		result, err := getGCPExporter(mockConfig)
+		assert.Equal(t, testCase.exporter, result)
+		assert.Equal(t, err != nil, testCase.err)
+	}
 }

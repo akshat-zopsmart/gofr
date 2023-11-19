@@ -2,6 +2,7 @@ package gofr
 
 import (
 	"context"
+	"gofr.dev/pkg"
 	"strconv"
 	"strings"
 
@@ -19,128 +20,148 @@ import (
 	"gofr.dev/pkg/log"
 )
 
-type exporter struct {
-	name    string
-	url     string
-	appName string
-}
+const (
+	ZIPKIN = "zipkin"
+	GCP    = "gcp"
+)
 
-func tracerProvider(c Config, logger log.Logger) (err error) {
-	appName := c.GetOrDefault("APP_NAME", "gofr")
-	exporterName := strings.ToLower(c.Get("TRACER_EXPORTER"))
+func tracerProvider(c Config, logger log.Logger) error {
 
-	e := exporter{
-		name:    exporterName,
-		url:     c.Get("TRACER_URL"),
-		appName: appName,
+	if tp, err := getTraceProvider(c, logger); err == nil {
+		otel.SetTracerProvider(tp)
+		otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	} else {
+		return err
 	}
 
-	var tp *trace.TracerProvider
+	return nil
+}
+
+func getTraceProvider(c Config, logger log.Logger) (tp *trace.TracerProvider, err error) {
+	exporterName := strings.ToLower(c.Get("TRACER_EXPORTER"))
+
+	if exporterName == "" {
+		logger.Warnf("exporter not defined, tracing would not be enabled")
+		return
+	}
+
+	var spanExporter trace.SpanExporter
 
 	switch exporterName {
-	case "zipkin":
-		tp, err = e.getZipkinExporter(c, logger)
-	case "gcp":
-		tp, err = getGCPExporter(c, logger)
+	case ZIPKIN:
+		spanExporter, err = getZipkinExporter(c)
+	case GCP:
+		spanExporter, err = getGCPExporter(c)
 	default:
-		return errors.Error("invalid exporter")
+		err = errors.Error("invalid exporter")
 	}
 
 	if err != nil {
 		return
 	}
 
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	r, err := resource.New(context.Background(), resource.WithAttributes(getResourceAttributes(c)...))
+	if err != nil {
+		return
+	}
 
+	sampler := getSampler(c, logger)
+
+	tp = trace.NewTracerProvider(trace.WithSampler(sampler), trace.WithBatcher(spanExporter), trace.WithResource(r))
 	return
 }
 
-func (e *exporter) getZipkinExporter(c Config, logger log.Logger) (*trace.TracerProvider, error) {
-	var tp *trace.TracerProvider
-
-	url := e.url + "/api/v2/spans"
+func getZipkinExporter(c Config) (*zipkin.Exporter, error) {
+	url := c.Get("TRACER_URL") + "/api/v2/spans"
 
 	exporter, err := zipkin.New(url)
 	if err != nil {
 		return nil, err
 	}
 
-	batcher := trace.NewBatchSpanProcessor(exporter)
+	return exporter, nil
+}
 
-	r, err := getResource(c)
+func getGCPExporter(c Config) (*cloudtrace.Exporter, error) {
+
+	projectID := c.Get("GCP_PROJECT_ID")
+	if projectID == "" {
+		return nil, errors.Error("Require GCP_PROJECT_ID env to be set")
+	}
+
+	exporter, err := cloudtrace.New(cloudtrace.WithProjectID(projectID))
 	if err != nil {
 		return nil, err
 	}
 
-	isAlwaysSample, err := strconv.ParseBool(c.Get("TRACER_ALWAYS_SAMPLE"))
-	if err != nil {
-		logger.Warn("TRACER_ALWAYS_SAMPLE is not set.'false' will be used by default")
-	}
+	return exporter, nil
+}
+
+func getSampler(c Config, logger log.Logger) trace.Sampler {
 
 	// if isAlwaysSample is set true for any service, it will sample all the trace
 	// else it will be sampled based on parent of the span.
-	if isAlwaysSample {
-		tp = trace.NewTracerProvider(trace.WithSampler(trace.AlwaysSample()), trace.WithSpanProcessor(batcher), trace.WithResource(r))
-	} else {
-		tracerRatio, err := strconv.ParseFloat(c.Get("TRACER_RATIO"), 64)
-		if err != nil {
-			tracerRatio = 0.1
+	isAlwaysSample := getBoolOrDefault(c, logger, "TRACER_ALWAYS_SAMPLE", false)
 
-			logger.Warn("TRACER_RATIO is not set.'0.1' will be used by default")
-		}
-		tp = trace.NewTracerProvider(trace.WithSampler(trace.ParentBased(trace.TraceIDRatioBased(tracerRatio))),
-			trace.WithSpanProcessor(batcher), trace.WithResource(r))
-	}
-
-	return tp, nil
-}
-
-func getGCPExporter(c Config, logger log.Logger) (*trace.TracerProvider, error) {
-	var tp *trace.TracerProvider
-
-	exporter, err := cloudtrace.New(cloudtrace.WithProjectID(c.Get("GCP_PROJECT_ID")))
-	if err != nil {
-		return nil, err
-	}
-
-	r, err := getResource(c)
-	if err != nil {
-		return nil, err
-	}
-
-	isAlwaysSample, err := strconv.ParseBool(c.Get("TRACER_ALWAYS_SAMPLE"))
-	if err != nil {
-		logger.Warn("TRACER_ALWAYS_SAMPLE is not set.'false' will be used by default")
-	}
+	var sampler trace.Sampler
 
 	if isAlwaysSample {
-		tp = trace.NewTracerProvider(
-			trace.WithSampler(trace.AlwaysSample()),
-			trace.WithBatcher(exporter),
-			trace.WithResource(r))
+		sampler = trace.AlwaysSample()
 	} else {
-		tracerRatio, err := strconv.ParseFloat(c.Get("TRACER_RATIO"), 64)
-		if err != nil {
-			tracerRatio = 0.1
-
-			logger.Warn("TRACER_RATIO is not set.'0.1' will be used by default")
-		}
-		tp = trace.NewTracerProvider(
-			trace.WithSampler(trace.TraceIDRatioBased(tracerRatio)),
-			trace.WithBatcher(exporter),
-			trace.WithResource(r))
+		tracerRatio := getFloat64OrDefault(c, logger, "TRACER_RATIO", 0.1)
+		sampler = trace.ParentBased(trace.TraceIDRatioBased(tracerRatio))
 	}
-
-	return tp, nil
+	return sampler
 }
 
-func getResource(c Config) (*resource.Resource, error) {
+func getResourceAttributes(c Config) []attribute.KeyValue {
 	attributes := []attribute.KeyValue{
 		attribute.String(string(semconv.TelemetrySDKLanguageKey), "go"),
-		attribute.String(string(semconv.TelemetrySDKVersionKey), c.GetOrDefault("APP_VERSION", "Dev")),
-		attribute.String(string(semconv.ServiceNameKey), c.GetOrDefault("APP_NAME", "Gofr-App")),
+		attribute.String(string(semconv.TelemetrySDKVersionKey), c.GetOrDefault("APP_VERSION", pkg.DefaultAppVersion)),
+		attribute.String(string(semconv.ServiceNameKey), c.GetOrDefault("APP_NAME", pkg.DefaultAppName)),
 	}
 
-	return resource.New(context.Background(), resource.WithAttributes(attributes...))
+	return attributes
+}
+
+// getBoolOrDefault returns the bool value of the given config
+// or default value in case the config is missing/invalid.
+//
+//	This function should be moved to config package eventually to avoid redundancy
+func getBoolOrDefault(c Config, logger log.Logger, key string, defaultValue bool) bool {
+	val := c.Get(key)
+
+	if val == "" {
+		logger.Warnf("%s is not set.'%s' will be used by default", key, strconv.FormatBool(defaultValue))
+		return defaultValue
+	}
+
+	if parsedVal, err := strconv.ParseBool(val); err == nil {
+		return parsedVal
+	} else {
+		logger.Warnf("%s set in %s is not parseable into float.'%s' will be used by default", val, key, strconv.FormatBool(defaultValue))
+		return defaultValue
+	}
+
+}
+
+// getFloat64OrDefault returns the float value of the given config
+// or default value in case the config is missing/invalid.
+//
+//	This function should be moved to config package eventually to avoid redundancy
+func getFloat64OrDefault(c Config, logger log.Logger, key string, defaultValue float64) float64 {
+	val := c.Get(key)
+
+	if val == "" {
+		logger.Warnf("%s is not set.'%s' will be used by default", key, defaultValue)
+		return defaultValue
+	}
+
+	if parsedVal, err := strconv.ParseFloat(val, 64); err == nil {
+		return parsedVal
+	} else {
+		logger.Warnf("%s set in %s is not parseable into float.'%s' will be used by default", val, key, defaultValue)
+		return defaultValue
+	}
+
 }
